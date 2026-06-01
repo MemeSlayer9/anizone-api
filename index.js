@@ -14,11 +14,89 @@ const BROWSER_HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-  Accept: "*/*",
+  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
   "Accept-Language": "en-US,en;q=0.9",
   "Accept-Encoding": "gzip, deflate, br",
+  "Cache-Control": "no-cache",
+  "Pragma": "no-cache",
   Connection: "keep-alive",
 };
+
+// ─── Helper: Build episode ID slug ───────────────────────────────────────────
+function buildEpisodeId(title, aniZoneId, episodeNumber) {
+  const titleSlug = (title || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "")   // strip non-alphanumeric (except spaces/hyphens)
+    .trim()
+    .replace(/\s+/g, "-")            // spaces → hyphens
+    .replace(/-+/g, "-");            // collapse multiple hyphens
+  return titleSlug
+    ? `${titleSlug}-${aniZoneId}-episode-${episodeNumber}`
+    : `${aniZoneId}-episode-${episodeNumber}`;
+}
+
+// ─── Helper: Fetch through multiple proxies ──────────────────────────────────
+async function fetchThroughProxy(url, options = {}) {
+  const isVercel = process.env.VERCEL === '1' || process.env.VERCEL_ENV;
+  
+  // List of proxy services to try (in order)
+  const proxies = [
+    // Only try direct connection on localhost
+    !isVercel ? null : undefined,
+    // Proxy 1: AllOrigins
+    (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+    // Proxy 2: CORS Anywhere (public instance)
+    (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+    // Proxy 3: ThingProxy
+    (url) => `https://thingproxy.freeboard.io/fetch/${url}`,
+    // Proxy 4: CodeTabs
+    (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+  ].filter(p => p !== undefined);
+
+  let lastError = null;
+
+  for (let i = 0; i < proxies.length; i++) {
+    const proxyFn = proxies[i];
+    const targetUrl = proxyFn ? proxyFn(url) : url;
+    const isDirect = !proxyFn;
+    
+    try {
+      console.log(`📡 Attempt ${i + 1}/${proxies.length}: ${isDirect ? 'Direct' : 'Proxy'} - ${url}`);
+      
+      const response = await axios.get(targetUrl, {
+        headers: isDirect ? { ...BROWSER_HEADERS, ...(options.headers || {}) } : {},
+        timeout: isDirect ? 20_000 : 30_000,
+        maxRedirects: 5,
+      });
+      
+      console.log(`✅ Success with attempt ${i + 1}`);
+      return response;
+      
+    } catch (error) {
+      lastError = error;
+      console.log(`❌ Attempt ${i + 1} failed: ${error.message}`);
+      
+      // If it's a timeout or network error, try next proxy immediately
+      if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+        continue;
+      }
+      
+      // If it's Cloudflare (403/503), skip direct and try proxies
+      if (error.response?.status === 403 || error.response?.status === 503) {
+        continue;
+      }
+      
+      // For other errors, still try next proxy
+      if (i < proxies.length - 1) {
+        continue;
+      }
+    }
+  }
+  
+  // All proxies failed
+  console.error('❌ All proxy attempts exhausted');
+  throw lastError || new Error('All proxy attempts failed');
+}
 
 // ─── AniList GraphQL ──────────────────────────────────────────────────────────
 const ANILIST_API = 'https://graphql.anilist.co';
@@ -128,9 +206,7 @@ async function findAniZoneIdByTitle(animeTitle, alternateTitles = []) {
   const titlesToTry = [
     animeTitle,
     ...alternateTitles,
-    // Remove special characters and try again
     animeTitle.replace(/[^\w\s]/g, ''),
-    // Try first word(s) only
     animeTitle.split(' ').slice(0, 2).join(' ')
   ].filter(Boolean);
 
@@ -139,13 +215,8 @@ async function findAniZoneIdByTitle(animeTitle, alternateTitles = []) {
       const searchUrl = `https://anizone.to/anime?search=${encodeURIComponent(title)}`;
       console.log(`🔍 Searching AniZone: ${searchUrl}`);
       
-      const { data: html } = await axios.get(searchUrl, {
-        headers: { ...BROWSER_HEADERS, Referer: "https://anizone.to/" },
-        timeout: 15_000,
-      });
+      const { data: html } = await fetchThroughProxy(searchUrl);
 
-      // Pattern 1: Direct anime links (not episode links)
-      // We want /anime/xxx but NOT /anime/xxx/1
       const pattern1 = /href="\/anime\/([a-z0-9-]+)"(?:\s|>)/gi;
       const pattern2 = /href="https?:\/\/anizone\.to\/anime\/([a-z0-9-]+)"(?:\s|>)/gi;
       
@@ -153,11 +224,9 @@ async function findAniZoneIdByTitle(animeTitle, alternateTitles = []) {
       const matches2 = [...html.matchAll(pattern2)];
       const allMatches = [...matches1, ...matches2];
       
-      // Filter out episode links (those followed by /number)
       const animeIds = allMatches
         .map(m => m[1])
         .filter(id => {
-          // Make sure it's not followed by a number (episode link)
           const idPattern = new RegExp(`/anime/${id}/(\\d+)`, 'i');
           return !idPattern.test(html);
         });
@@ -196,11 +265,26 @@ function buildSubtitleCandidates(uuidBase) {
   return out;
 }
 
+// ─── Build common subtitle URLs without probing ──────────────────────────────
+function buildCommonSubtitles(uuidBase) {
+  // Return the most common subtitle combinations
+  const common = [];
+  const langs = ["en", "ja", "es", "es-419", "pt", "pt-BR", "fr", "de", "ar", "zh", "zh-Hans", "zh-Hant", "ko", "ru"];
+  
+  for (let i = 0; i <= 3; i++) {
+    for (const lang of langs) {
+      common.push(`${uuidBase}/subtitles/${i}_${lang}.ass`);
+    }
+  }
+  
+  return common;
+}
+
 async function probe(url) {
   try {
     const r = await axios.head(url, {
       headers: { ...BROWSER_HEADERS, Referer: "https://anizone.to/" },
-      timeout: 6_000,
+      timeout: 3_000, // Reduced from 6s to 3s
       validateStatus: (s) => s < 400,
     });
     return r.status < 400 ? url : null;
@@ -208,14 +292,44 @@ async function probe(url) {
 }
 
 async function probeSubtitles(uuidBase) {
-  const candidates = buildSubtitleCandidates(uuidBase);
-  const BATCH = 20;
-  const found = [];
-  for (let i = 0; i < candidates.length; i += BATCH) {
-    const results = await Promise.all(candidates.slice(i, i + BATCH).map(probe));
-    results.forEach((u) => u && found.push(u));
+  // On Vercel or if we want to be fast, just return all possible subtitle URLs
+  // The video player will try to load them and ignore 404s
+  const isVercel = process.env.VERCEL === '1' || process.env.VERCEL_ENV;
+  
+  if (isVercel) {
+    console.log('⚠️ Returning all subtitle candidates without probing (Vercel mode)');
+    // Return most common subtitles only to reduce response size
+    return buildCommonSubtitles(uuidBase);
   }
-  return found;
+  
+  // On localhost, do proper probing with timeout
+  const candidates = buildSubtitleCandidates(uuidBase);
+  const BATCH = 30; // Increased batch size for faster probing
+  const found = [];
+  
+  // Add timeout for entire probing operation
+  const probePromise = (async () => {
+    for (let i = 0; i < candidates.length; i += BATCH) {
+      const results = await Promise.all(candidates.slice(i, i + BATCH).map(probe));
+      results.forEach((u) => u && found.push(u));
+    }
+    return found;
+  })();
+  
+  try {
+    // Timeout after 8 seconds total
+    const result = await Promise.race([
+      probePromise,
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Subtitle probing timeout')), 8_000)
+      )
+    ]);
+    
+    return result.length > 0 ? result : buildCommonSubtitles(uuidBase);
+  } catch (error) {
+    console.log('⚠️ Subtitle probing timed out, returning common subtitles');
+    return buildCommonSubtitles(uuidBase);
+  }
 }
 
 // ─── Fetch & parse master.m3u8 ───────────────────────────────────────────────
@@ -244,6 +358,8 @@ async function fetchTracksFromMaster(masterUrl) {
 
     tracks.push(`${uuidBase}/storyboard.vtt`);
     tracks.push(`${uuidBase}/chapters.vtt`);
+    
+    // Get subtitles (will use common subtitles on Vercel, probe on localhost)
     (await probeSubtitles(uuidBase)).forEach((u) => tracks.push(u));
 
     return [...new Set(tracks)];
@@ -317,14 +433,10 @@ app.get("/latest", async (req, res) => {
   try {
     console.log(`📡 Fetching latest episodes from AniZone homepage...`);
     
-    const { data: html } = await axios.get("https://anizone.to/", {
-      headers: { ...BROWSER_HEADERS, Referer: "https://anizone.to/" },
-      timeout: 15_000,
-    });
+    const { data: html } = await fetchThroughProxy("https://anizone.to/");
 
     const latestEpisodes = [];
     
-    // Match each <li> block containing episode information
     const episodeBlocks = [...html.matchAll(/<li[^>]*x-data[^>]*>([\s\S]*?)<\/li>/gi)];
     
     console.log(`📺 Found ${episodeBlocks.length} episode blocks`);
@@ -332,7 +444,6 @@ app.get("/latest", async (req, res) => {
     for (const block of episodeBlocks) {
       const liHtml = block[0];
       
-      // Extract episode URL and episode number
       const episodeUrlMatch = liHtml.match(/href=["'](https:\/\/anizone\.to\/anime\/([^"'\/]+)\/(\d+))["']/i);
       if (!episodeUrlMatch) continue;
       
@@ -340,17 +451,14 @@ app.get("/latest", async (req, res) => {
       const animeId = episodeUrlMatch[2];
       const episodeNumber = parseInt(episodeUrlMatch[3]);
       
-      // Extract anime URL and title
       const animeLinkMatch = liHtml.match(/href=["'](https:\/\/anizone\.to\/anime\/[^"'\/]+)["'][^>]*title=["']([^"']+)["']/i);
       const animeUrl = animeLinkMatch ? animeLinkMatch[1] : null;
       const animeTitle = animeLinkMatch ? animeLinkMatch[2] : null;
       
-      // Extract episode title
       const episodeTitleMatch = liHtml.match(/title=["']Episode \d+[^"']*:([^"']+)["']/i) 
                              || liHtml.match(/>Episode \d+\s*:\s*([^<]+)</i);
       const episodeTitle = episodeTitleMatch ? episodeTitleMatch[1].trim() : null;
       
-      // Extract snapshot and teaser images
       const snapshotMatch = liHtml.match(/src=["'](https:\/\/[^"']+\/snapshot\.webp)["']/i);
       const teaserMatch = liHtml.match(/:src=["'][^"']*\?\s*["'](https:\/\/[^"']+\/teaser\.webp)["']/i)
                        || liHtml.match(/["'](https:\/\/[^"']+\/teaser\.webp)["']/i);
@@ -358,15 +466,12 @@ app.get("/latest", async (req, res) => {
       const snapshot = snapshotMatch ? snapshotMatch[1] : null;
       const teaser = teaserMatch ? teaserMatch[1] : null;
       
-      // Extract duration
       const durationMatch = liHtml.match(/>(\d+:\d+)<\//i);
       const duration = durationMatch ? durationMatch[1] : null;
       
-      // Extract release date
       const dateMatch = liHtml.match(/(\d{4}-\d{2}-\d{2})/i);
       const releaseDate = dateMatch ? dateMatch[1] : null;
       
-      // Extract "Today", "Yesterday", etc. label
       const timeLabelMatch = liHtml.match(/title=["']([^"']+)["'][^>]*>[^<]*<svg[^>]*>[^<]*<\/svg>\s*(\d{4}-\d{2}-\d{2})/i);
       const timeLabel = timeLabelMatch ? timeLabelMatch[1] : null;
       
@@ -380,7 +485,8 @@ app.get("/latest", async (req, res) => {
           number: episodeNumber,
           title: episodeTitle,
           url: episodeUrl,
-          episodeId: `${animeId}/${episodeNumber}`,
+          // ── New episodeId format ──────────────────────────────────────────
+          episodeId: buildEpisodeId(animeTitle, animeId, episodeNumber),
         },
         images: {
           snapshot,
@@ -410,8 +516,6 @@ app.get("/latest", async (req, res) => {
 });
 
 // ─── GET /details/:animeId  ───────────────────────────────────────────────────
-// Accepts both AniList ID (numeric) or AniZone ID (alphanumeric)
-// e.g. GET /details/21 or GET /details/uyyyn4kf
 app.get("/details/:animeId", async (req, res) => {
   let { animeId } = req.params;
   const isAniListId = /^\d+$/.test(animeId);
@@ -420,7 +524,6 @@ app.get("/details/:animeId", async (req, res) => {
   let aniZoneId = animeId;
 
   try {
-    // If numeric ID, fetch from AniList and find matching AniZone ID
     if (isAniListId) {
       console.log(`🔍 Fetching AniList data for ID: ${animeId}`);
       aniListData = await getAniListAnime(animeId);
@@ -434,7 +537,6 @@ app.get("/details/:animeId", async (req, res) => {
 
       console.log(`✅ Found on AniList: ${aniListData.title.english || aniListData.title.romaji}`);
 
-      // Collect all possible title variations
       const alternateTitles = [
         aniListData.title.english,
         aniListData.title.romaji,
@@ -442,16 +544,13 @@ app.get("/details/:animeId", async (req, res) => {
         ...(aniListData.synonyms || [])
       ].filter(Boolean);
 
-      // Try to find the anime on AniZone using the title
       const searchTitle = aniListData.title.english || aniListData.title.romaji;
       console.log(`🔍 Searching AniZone for: ${searchTitle}`);
-      console.log(`📝 Alternate titles:`, alternateTitles);
       
       aniZoneId = await findAniZoneIdByTitle(searchTitle, alternateTitles);
 
       if (!aniZoneId) {
         console.log(`⚠️  Not found on AniZone`);
-        // Return AniList data even if not found on AniZone
         return res.json({
           success: true,
           source: "anilist_only",
@@ -480,14 +579,10 @@ app.get("/details/:animeId", async (req, res) => {
       console.log(`✅ Found on AniZone with ID: ${aniZoneId}`);
     }
 
-    // Now fetch from AniZone using the aniZoneId
     const pageUrl = `https://anizone.to/anime/${aniZoneId}`;
     console.log(`📡 Fetching AniZone page: ${pageUrl}`);
 
-    const { data: html } = await axios.get(pageUrl, {
-      headers: { ...BROWSER_HEADERS, Referer: "https://anizone.to/" },
-      timeout: 15_000,
-    });
+    const { data: html } = await fetchThroughProxy(pageUrl);
 
     // ── Poster image ──────────────────────────────────────────────────────────
     const imgMatch = html.match(/<img[^>]+src=["'](https:\/\/anizone\.to\/images\/anime\/[^"']+)["'][^>]+alt=["']([^"']*)["'][^>]*>/i)
@@ -546,13 +641,14 @@ app.get("/details/:animeId", async (req, res) => {
     // ── Episode list ──────────────────────────────────────────────────────────
     console.log(`📺 Extracting episodes...`);
 
-    // First, get episode count from metadata
     const epCountMatch = html.match(/(\d+)\s*Episodes?/i);
     const totalEpisodes = epCountMatch ? parseInt(epCountMatch[1]) : (aniListData?.episodes || null);
 
     console.log(`📊 Total episodes: ${totalEpisodes}`);
 
-    // Extract visible episodes from the page
+    // Resolve the display title to use for episodeId slugs
+    const displayTitle = title || aniListData?.title.english || aniListData?.title.romaji || "";
+
     const episodeBlocks = [...html.matchAll(
       /<a[^>]+href="(https?:\/\/anizone\.to\/anime\/[^"]+\/(\d+))"[^>]*>[\s\S]*?<\/a>/gi
     )];
@@ -561,7 +657,7 @@ app.get("/details/:animeId", async (req, res) => {
 
     const episodes = [];
     const seenEps  = new Set();
-    const episodeDetails = new Map(); // Store detailed info for episodes we found
+    const episodeDetails = new Map();
 
     for (const block of episodeBlocks) {
       const epUrl  = block[1];
@@ -590,13 +686,10 @@ app.get("/details/:animeId", async (req, res) => {
       const altMatch = epHtml.match(/alt="([^"]+)"/i);
       const altText  = altMatch ? altMatch[1] : null;
 
-      const episodeIdMatch = epUrl.match(/\/anime\/([^\/]+\/\d+)/);
-      const episodeId = episodeIdMatch ? episodeIdMatch[1] : null;
-
-      // Store detailed info
       episodeDetails.set(epNum, {
         episode:     epNum,
-        episodeId:   episodeId,
+        // ── New episodeId format ──────────────────────────────────────────────
+        episodeId:   buildEpisodeId(displayTitle, aniZoneId, epNum),
         url:         epUrl,
         title:       epTitle,
         alt:         altText,
@@ -608,17 +701,15 @@ app.get("/details/:animeId", async (req, res) => {
       });
     }
 
-    // Now generate all episodes (1 to totalEpisodes)
     if (totalEpisodes) {
       for (let i = 1; i <= totalEpisodes; i++) {
         if (episodeDetails.has(i)) {
-          // Use detailed info if we have it
           episodes.push(episodeDetails.get(i));
         } else {
-          // Generate basic episode entry
           episodes.push({
             episode:     i,
-            episodeId:   `${aniZoneId}/${i}`,
+            // ── New episodeId format ────────────────────────────────────────
+            episodeId:   buildEpisodeId(displayTitle, aniZoneId, i),
             url:         `https://anizone.to/anime/${aniZoneId}/${i}`,
             title:       `Episode ${i}`,
             alt:         null,
@@ -631,12 +722,11 @@ app.get("/details/:animeId", async (req, res) => {
         }
       }
     } else {
-      // If we don't have total count, just use what we found
       episodeDetails.forEach(ep => episodes.push(ep));
     }
 
     episodes.sort((a, b) => a.episode - b.episode);
-    console.log(`✅ Generated ${episodes.length} episodes (${episodeDetails.size} with details, ${episodes.length - episodeDetails.size} generated)`);
+    console.log(`✅ Generated ${episodes.length} episodes`);
 
     const response = {
       success:       true,
@@ -658,7 +748,6 @@ app.get("/details/:animeId", async (req, res) => {
       episodes,
     };
 
-    // Add AniList data if available
     if (aniListData) {
       response.anilist_id = aniListData.id;
       response.anilist_url = aniListData.siteUrl;
@@ -689,10 +778,7 @@ app.get("/scrape", async (req, res) => {
   if (!url) return res.status(400).json({ error: "Missing ?url= query parameter" });
 
   try {
-    const { data: html } = await axios.get(url, {
-      headers: { ...BROWSER_HEADERS, Referer: "https://anizone.to/" },
-      timeout: 15_000,
-    });
+    const { data: html } = await fetchThroughProxy(url);
 
     const mediaRegex = /https?:\/\/[^"'\s]+\.(m3u8|vtt|webvtt|ass|ssa)[^"'\s]*/gi;
     let found = html.match(mediaRegex) || [];
@@ -724,14 +810,74 @@ app.get("/streams", async (_req, res) => {
   res.json(buildResponse([...new Set([DEFAULT_MASTER, ...tracks])]));
 });
 
+// ─── GET /watch/:episodeId ────────────────────────────────────────────────────
+// episodeId format: {title-slug}-{aniZoneId}-episode-{number}
+// e.g. bleach-sennen-kessen-hen-at9uzjzo-episode-1
+app.get("/watch/:episodeId", async (req, res) => {
+  const { episodeId } = req.params;
+
+  // AniZone IDs are always 8 lowercase alphanumeric chars
+  const match = episodeId.match(/^(.+)-([a-z0-9]{8})-episode-(\d+)$/);
+  if (!match) {
+    return res.status(400).json({
+      error: "Invalid episodeId format",
+      expected: "{title-slug}-{8-char-anizone-id}-episode-{number}",
+      received: episodeId,
+    });
+  }
+
+  const [, , aniZoneId, episodeNumber] = match;
+  const episodeUrl = `https://anizone.to/anime/${aniZoneId}/${episodeNumber}`;
+
+  console.log(`🎬 /watch/${episodeId} → ${episodeUrl}`);
+
+  try {
+    const { data: html } = await fetchThroughProxy(episodeUrl);
+
+    const mediaRegex = /https?:\/\/[^"'\s]+\.(m3u8|vtt|webvtt|ass|ssa)[^"'\s]*/gi;
+    let found = html.match(mediaRegex) || [];
+    const kvRegex = /(?:file|src|source|url)\s*[=:]\s*["']([^"']+\.(?:m3u8|vtt|ass)[^"']*)/gi;
+    let m;
+    while ((m = kvRegex.exec(html)) !== null) found.push(m[1]);
+    found = [...new Set(found)];
+
+    if (found.length === 0) {
+      return res.status(404).json({ success: false, error: "No media URLs found for this episode." });
+    }
+
+    const masters     = found.filter((u) => /master\.m3u8/i.test(u));
+    const seeds       = masters.length > 0 ? masters : found;
+    const trackArrays = await Promise.all(seeds.map(fetchTracksFromMaster));
+    const allUrls     = [...new Set([...seeds, ...trackArrays.flat()])];
+
+    return res.json({
+      ...buildResponse(allUrls),
+      episodeId,
+      anizone_id: aniZoneId,
+      episode: parseInt(episodeNumber),
+      source_url: episodeUrl,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      error: "Failed to fetch episode streams",
+      detail: err.message,
+      episodeId,
+      anizone_id: aniZoneId,
+      episode: parseInt(episodeNumber),
+    });
+  }
+});
+
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get("/", (_req, res) =>
   res.json({
     status: "ok",
+    environment: process.env.NODE_ENV || 'development',
     routes: {
       "GET /":                          "API health check and available routes",
       "GET /latest":                    "Get latest episodes from AniZone homepage",
       "GET /details/:animeId":          "Get anime details (accepts AniList ID or AniZone ID)",
+      "GET /watch/:episodeId":          "Get streams by episodeId slug (e.g. bleach-sennen-kessen-hen-at9uzjzo-episode-1)",
       "GET /scrape?url=<episode_page>": "Scrape episode streams → master/video/audio/subtitle/storyboard/chapters",
       "GET /streams":                   "Return default episode streams live from CDN",
     },
