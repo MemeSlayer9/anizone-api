@@ -335,11 +335,11 @@ async function probeSubtitles(uuidBase) {
 // ─── Fetch & parse master.m3u8 ───────────────────────────────────────────────
 async function fetchTracksFromMaster(masterUrl) {
   try {
-    const { data: text } = await axios.get(masterUrl, {
-      headers: { ...BROWSER_HEADERS, Referer: "https://anizone.to/" },
-      responseType: "text",
-      timeout: 10_000,
+    // ← Use fetchThroughProxy instead of direct axios.get
+    const { data: text } = await fetchThroughProxy(masterUrl, {
+      headers: { Referer: "https://anizone.to/" },
     });
+
     const base     = masterUrl.substring(0, masterUrl.lastIndexOf("/") + 1);
     const uuidBase = masterUrl.replace(/\/master\.m3u8.*$/, "");
     const tracks   = [];
