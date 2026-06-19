@@ -37,48 +37,53 @@ function buildEpisodeId(title, aniZoneId, episodeNumber) {
 
 // ─── Helper: Fetch through multiple proxies ──────────────────────────────────
 async function fetchThroughProxy(url, options = {}) {
+  const isVercel = process.env.VERCEL === '1' || process.env.VERCEL_ENV;
+
   const proxies = [
-    null, // Direct — always try first; CORS is browser-only, Vercel can fetch directly
+    // Try direct everywhere — cheap, and Cloudflare doesn't block every
+    // datacenter IP, only fingerprinted bot traffic. Worst case it fails fast.
+    () => url,
     (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-    (u) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+    (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}`, // fixed: needs url=
     (u) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
-    (u) => `https://thingproxy.freeboard.io/fetch/${encodeURIComponent(u)}`, // was missing encodeURIComponent
+    // thingproxy dropped — too frequently dead to be worth the slot
   ];
 
   let lastError = null;
 
   for (let i = 0; i < proxies.length; i++) {
-    const proxyFn  = proxies[i];
-    const isDirect = proxyFn === null;
-    const target   = isDirect ? url : proxyFn(url);
+    const isDirect = i === 0;
+    const targetUrl = proxies[i](url);
 
     try {
-      console.log(`📡 Attempt ${i + 1}/${proxies.length}: ${isDirect ? "Direct" : "Proxy"} → ${url}`);
+      console.log(`📡 Attempt ${i + 1}/${proxies.length}: ${isDirect ? 'Direct' : targetUrl}`);
 
-      const response = await axios.get(target, {
-        headers: {           // always send browser headers — proxies need them too
-          ...BROWSER_HEADERS,
-          ...(options.headers || {}),
-        },
-        timeout:      isDirect ? 15_000 : 20_000,
+      const response = await axios.get(targetUrl, {
+        headers: { ...BROWSER_HEADERS, ...(options.headers || {}) }, // send real headers always
+        timeout: isDirect ? 10_000 : 20_000,
         maxRedirects: 5,
+        validateStatus: (s) => s < 500, // let us inspect 4xx instead of throwing blind
       });
 
-      console.log(`✅ Success on attempt ${i + 1}`);
+      if (response.status >= 400) {
+        console.log(`⚠️ Attempt ${i + 1} returned ${response.status}: ${String(response.data).slice(0, 200)}`);
+        lastError = new Error(`Status ${response.status} from attempt ${i + 1}`);
+        continue;
+      }
+
+      console.log(`✅ Success with attempt ${i + 1}`);
       return response;
 
-    } catch (err) {
-      lastError = err;
-      const status = err.response?.status;
-      console.log(`❌ Attempt ${i + 1} failed [${status ?? err.code ?? err.message}]`);
-      // always try next — don't gate on specific status codes
+    } catch (error) {
+      lastError = error;
+      console.log(`❌ Attempt ${i + 1} failed: ${error.message} ${error.response?.status ?? ''} ${String(error.response?.data).slice(0, 200)}`);
+      continue;
     }
   }
 
-  console.error("❌ All attempts exhausted for:", url);
-  throw lastError ?? new Error("All fetch attempts failed");
+  console.error('❌ All proxy attempts exhausted');
+  throw lastError || new Error('All proxy attempts failed');
 }
-
 // ─── AniList GraphQL ──────────────────────────────────────────────────────────
 const ANILIST_API = 'https://graphql.anilist.co';
 
