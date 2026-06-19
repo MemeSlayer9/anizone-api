@@ -37,65 +37,46 @@ function buildEpisodeId(title, aniZoneId, episodeNumber) {
 
 // ─── Helper: Fetch through multiple proxies ──────────────────────────────────
 async function fetchThroughProxy(url, options = {}) {
-  const isVercel = process.env.VERCEL === '1' || process.env.VERCEL_ENV;
-  
-  // List of proxy services to try (in order)
   const proxies = [
-    // Only try direct connection on localhost
-    !isVercel ? null : undefined,
-    // Proxy 1: AllOrigins
-    (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-    // Proxy 2: CORS Anywhere (public instance)
-    (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
-    // Proxy 3: ThingProxy
-    (url) => `https://thingproxy.freeboard.io/fetch/${url}`,
-    // Proxy 4: CodeTabs
-    (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
-  ].filter(p => p !== undefined);
+    null, // Direct — always try first; CORS is browser-only, Vercel can fetch directly
+    (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+    (u) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+    (u) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
+    (u) => `https://thingproxy.freeboard.io/fetch/${encodeURIComponent(u)}`, // was missing encodeURIComponent
+  ];
 
   let lastError = null;
 
   for (let i = 0; i < proxies.length; i++) {
-    const proxyFn = proxies[i];
-    const targetUrl = proxyFn ? proxyFn(url) : url;
-    const isDirect = !proxyFn;
-    
+    const proxyFn  = proxies[i];
+    const isDirect = proxyFn === null;
+    const target   = isDirect ? url : proxyFn(url);
+
     try {
-      console.log(`📡 Attempt ${i + 1}/${proxies.length}: ${isDirect ? 'Direct' : 'Proxy'} - ${url}`);
-      
-      const response = await axios.get(targetUrl, {
-        headers: isDirect ? { ...BROWSER_HEADERS, ...(options.headers || {}) } : {},
-        timeout: isDirect ? 20_000 : 30_000,
+      console.log(`📡 Attempt ${i + 1}/${proxies.length}: ${isDirect ? "Direct" : "Proxy"} → ${url}`);
+
+      const response = await axios.get(target, {
+        headers: {           // always send browser headers — proxies need them too
+          ...BROWSER_HEADERS,
+          ...(options.headers || {}),
+        },
+        timeout:      isDirect ? 15_000 : 20_000,
         maxRedirects: 5,
       });
-      
-      console.log(`✅ Success with attempt ${i + 1}`);
+
+      console.log(`✅ Success on attempt ${i + 1}`);
       return response;
-      
-    } catch (error) {
-      lastError = error;
-      console.log(`❌ Attempt ${i + 1} failed: ${error.message}`);
-      
-      // If it's a timeout or network error, try next proxy immediately
-      if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
-        continue;
-      }
-      
-      // If it's Cloudflare (403/503), skip direct and try proxies
-      if (error.response?.status === 403 || error.response?.status === 503) {
-        continue;
-      }
-      
-      // For other errors, still try next proxy
-      if (i < proxies.length - 1) {
-        continue;
-      }
+
+    } catch (err) {
+      lastError = err;
+      const status = err.response?.status;
+      console.log(`❌ Attempt ${i + 1} failed [${status ?? err.code ?? err.message}]`);
+      // always try next — don't gate on specific status codes
     }
   }
-  
-  // All proxies failed
-  console.error('❌ All proxy attempts exhausted');
-  throw lastError || new Error('All proxy attempts failed');
+
+  console.error("❌ All attempts exhausted for:", url);
+  throw lastError ?? new Error("All fetch attempts failed");
 }
 
 // ─── AniList GraphQL ──────────────────────────────────────────────────────────
